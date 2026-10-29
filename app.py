@@ -21,13 +21,21 @@ ALLOWED = ["create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"]
 NO_ACTION_CODES = ["ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"]
 MAX_BODY = 4 * 1024 * 1024
-CHUNK = 12
+CHUNK = 10
 DB_PATH = os.environ.get("DB_PATH", "/tmp/mailroom.db")
 LLM_BASE = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
 LLM_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
 
 app = FastAPI()
+ERRORS = []
+
+
+def note_error(msg):
+    ERRORS.append(msg[:500])
+    del ERRORS[:-10]
+
+
 LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
 
@@ -157,6 +165,7 @@ def render_dossiers(chunk):
 
 def call_llm(chunk, deadline):
     if not LLM_KEY:
+        note_error("LLM_API_KEY is not set")
         return {}
     payload = {
         "model": LLM_MODEL,
@@ -165,6 +174,7 @@ def call_llm(chunk, deadline):
         "messages": [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": "Decide for each dossier below.\n\n" + render_dossiers(chunk)}],
     }
+    r = None
     for attempt in range(2):
         left = deadline - time.time()
         if left < 8:
@@ -177,7 +187,13 @@ def call_llm(chunk, deadline):
             text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
             data = json.loads(text)
             return {x.get("dossierId"): x for x in data.get("decisions", []) if isinstance(x, dict)}
-        except Exception:
+        except Exception as e:
+            snippet = ""
+            try:
+                snippet = r.text[:300]
+            except Exception:
+                pass
+            note_error(f"{type(e).__name__}: {e} | {snippet}")
             time.sleep(1)
     return {}
 
@@ -288,7 +304,7 @@ def handle_propose(body):
         if misses:
             deadline = time.time() + 46
             chunks = [misses[i:i + CHUNK] for i in range(0, len(misses), CHUNK)]
-            with ThreadPoolExecutor(max_workers=5) as ex:
+            with ThreadPoolExecutor(max_workers=3) as ex:
                 results = list(ex.map(lambda c: call_llm(c, deadline), chunks))
             decs = {}
             for r in results:
@@ -346,12 +362,19 @@ def handle_commit(body):
             raise HttpErr(404, "unknown evaluation")
         digest, verifier, response, commit_hash, commit_response = row
         if body.get("inputDigest") != digest:
-            raise HttpErr(400, "inputDigest mismatch")
+            raise HttpErr(409, "inputDigest differs from this evaluation")
         stored = json.loads(response)["proposals"]
         by_id = {p["dossierId"]: p for p in stored}
         receipts = body.get("receipts")
         if not isinstance(receipts, list) or len(receipts) != len(stored):
             raise HttpErr(422, "receipts must match proposals")
+        if commit_response:
+            try:
+                same = commit_hash == sha(canon(sorted(receipts, key=lambda x: x["dossierId"])))
+            except Exception:
+                same = False
+            if not same:
+                raise HttpErr(409, "evaluation already committed with different receipts")
         seen = set()
         for r in receipts:
             if not isinstance(r, dict):
@@ -412,6 +435,21 @@ def process(raw):
 @app.get("/")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug")
+def debug():
+    info = {"key_set": bool(LLM_KEY), "model": LLM_MODEL, "base": LLM_BASE, "recent_errors": ERRORS[-5:]}
+    try:
+        t = time.time()
+        r = httpx.post(LLM_BASE + "/chat/completions",
+                       headers={"Authorization": "Bearer " + LLM_KEY}, timeout=30,
+                       json={"model": LLM_MODEL, "response_format": {"type": "json_object"},
+                             "messages": [{"role": "user", "content": "Reply with the JSON {\"ok\":true}"}]})
+        info.update(status=r.status_code, secs=round(time.time() - t, 1), body=r.text[:300])
+    except Exception as e:
+        info["exception"] = str(e)
+    return info
 
 
 @app.post("/")
