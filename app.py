@@ -285,36 +285,34 @@ def format_chunk(dossiers: list) -> str:
 def call_llm(chunk: list, timeout_sec: float) -> dict:
     if not LLM_KEY:
         return {}
+    
     prompt = format_chunk(chunk)
+    
+    # Use the Native Google Gemini URL instead of the OpenAI wrapper
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
+    
     payload = {
-        "model": LLM_MODEL,
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Analyze these dossiers and return the decision array:\n\n{prompt}",
-            },
-        ],
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": f"Analyze these dossiers and return the decision array:\n\n{prompt}"}]
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json"
+        }
     }
-    headers = {
-        "Authorization": f"Bearer {LLM_KEY}",
-        "Content-Type": "application/json",
-    }
+    
     client = httpx.Client(timeout=timeout_sec)
     try:
-        resp = client.post(
-            f"{LLM_BASE}/chat/completions", json=payload, headers=headers
-        )
+        resp = client.post(url, json=payload)
         resp.raise_for_status()
+        
         data = resp.json()
-        raw_text = data["choices"][0]["message"]["content"].strip()
-        if raw_text.startswith("```"):
-            raw_text = re.sub(
-                r"^```(?:json)?\s*", "", raw_text, flags=re.MULTILINE
-            )
-            raw_text = re.sub(r"\s*```$", "", raw_text, flags=re.MULTILINE)
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
         parsed = json.loads(raw_text)
         return {
             item["dossierId"]: item
@@ -322,6 +320,7 @@ def call_llm(chunk: list, timeout_sec: float) -> dict:
             if isinstance(item, dict) and "dossierId" in item
         }
     except Exception as e:
+        # Keep our error catching active just in case!
         raise HttpError(500, f"AI API crashed: {str(e)}")
     finally:
         client.close()
