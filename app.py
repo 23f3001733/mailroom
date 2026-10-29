@@ -321,8 +321,8 @@ def call_llm(chunk: list, timeout_sec: float) -> dict:
             for item in parsed.get("decisions", [])
             if isinstance(item, dict) and "dossierId" in item
         }
-    except Exception:
-        return {}
+    except Exception as e:
+        raise HttpError(500, f"AI API crashed: {str(e)}")
     finally:
         client.close()
 
